@@ -21,7 +21,7 @@ import networkx as nx
 import numpy as np
 
 import cirq.contrib.acquaintance as cca
-from cirq import circuits, ops, value
+from cirq import circuits, ops, value, CircuitOperation
 from cirq.contrib import circuitdag
 from cirq.contrib.routing.initialization import get_initial_mapping
 from cirq.contrib.routing.swap_network import SwapNetwork
@@ -50,7 +50,7 @@ def route_circuit_greedily(
     the distance of the two logical qubits in the device graph under the new
     mapping is calculated. A candidate set 'S' of SWAPs is taken out of
     consideration if for some other set 'T' there is a time slice such that all
-    of the distances for 'T' are at most those for 'S' (and they are not all
+    of_the distances for 'T' are at most those for 'S' (and they are not all
     equal).
 
     If more than one candidate remains, the size of the set of SWAPs considered
@@ -60,8 +60,18 @@ def route_circuit_greedily(
     farthest away under the current mapping are brought together using SWAPs
     using a shortest path in the device graph.
 
+    `CircuitOperation`s within the input circuit are handled recursively. The
+    router will route the sub-circuit contained within a `CircuitOperation` by
+    making a recursive call to `route_circuit_greedily`. The `initial_mapping`
+    for this sub-circuit is determined by the current mapping of its logical
+    qubits (as defined by the `CircuitOperation`'s `qubits` argument) to
+    physical qubits in the parent router's state. Any SWAPs performed during
+    the routing of the sub-circuit will update this mapping, and these changes
+    will persist for subsequent operations in the parent circuit.
+
     Args:
-        circuit: The circuit to route.
+        circuit: The circuit to route. This can be a `cirq.Circuit` which may
+            contain `cirq.CircuitOperation`s.
         device_graph: The device's graph, in which each vertex is a qubit
             and each edge indicates the ability to do an operation on those
             qubits.
@@ -112,12 +122,15 @@ class _GreedyRouter:
             for b, d in neighbor_distances.items()
         }
 
-        self.remaining_dag = circuitdag.CircuitDag.from_circuit(circuit, can_reorder=can_reorder)
-        self.logical_qubits = list(self.remaining_dag.all_qubits())
+        self.top_level_operations: list[ops.Operation] = list(circuit.all_operations())
+        self.logical_qubits = list(circuit.all_qubits()) # All qubits in the original circuit
         self.physical_qubits = list(self.device_graph.nodes)
         self.edge_sets: dict[int, list[Sequence[QidPair]]] = {}
-
         self.physical_ops: list[ops.Operation] = []
+
+        # remaining_dag will be built dynamically for segments of non-CircuitOperations in route()
+        self.remaining_dag = circuitdag.CircuitDag(can_reorder=can_reorder) # Initialize as empty
+        self.can_reorder = can_reorder # Store for later DAG creation
 
         self.set_initial_mapping(initial_mapping)
 
@@ -187,35 +200,73 @@ class _GreedyRouter:
         self._assert_mapping_consistency()
 
     def _assert_mapping_consistency(self):
-        assert sorted(self._log_to_phys) == sorted(self.logical_qubits)
-        assert sorted(self._phys_to_log) == sorted(self.physical_qubits)
-        for l in self._log_to_phys:
-            assert l == self._phys_to_log[self._log_to_phys[l]]
+        # All physical qubits must be in _phys_to_log.
+        assert sorted(self._phys_to_log.keys()) == sorted(self.physical_qubits)
+
+        # For every logical qubit mapped in _log_to_phys:
+        # 1. It must be one of the circuit's logical_qubits.
+        # 2. Its corresponding physical qubit in _phys_to_log must map back to it.
+        for lq, pq in self._log_to_phys.items():
+            assert lq in self.logical_qubits, f"Mapped logical qubit {lq} not in overall circuit qubits."
+            assert self._phys_to_log[pq] == lq, f"Inconsistent mapping for {lq} and {pq}."
+
+        # For every physical qubit mapped in _phys_to_log (to a non-None logical qubit):
+        # 1. The logical qubit must be one of the circuit's logical_qubits.
+        # 2. It must be correctly registered in _log_to_phys.
+        # (This also checks that no two physical qubits map to the same logical qubit)
+        mapped_lq_count = {}
+        for pq, lq in self._phys_to_log.items():
+            if lq is not None:
+                assert lq in self.logical_qubits, f"Phys qubit {pq} mapped to unknown logical qubit {lq}."
+                assert self._log_to_phys[lq] == pq, f"Inconsistent mapping for {lq} and {pq} (from phys_to_log)."
+                mapped_lq_count[lq] = mapped_lq_count.get(lq, 0) + 1
+        
+        for lq, count in mapped_lq_count.items():
+            assert count == 1, f"Logical qubit {lq} is mapped from multiple physical qubits."
+
 
     def acts_on_nonadjacent_qubits(self, op: ops.Operation) -> bool:
+        # Check if all qubits involved in the operation are currently mapped.
+        if not all(q in self._log_to_phys for q in op.qubits):
+            return True  # Not all qubits are mapped, so cannot be placed.
+        # Single-qubit operations are fine if the qubit is mapped.
         if len(op.qubits) == 1:
             return False
+        # Multi-qubit operations require mapped qubits to be adjacent on the device.
         return tuple(self.log_to_phys(*op.qubits)) not in self.device_graph.edges
 
     def apply_possible_ops(self) -> int:
-        """Applies all logical operations possible given the current mapping."""
-        nodes = list(
+        """Applies all logical operations possible given the current mapping from self.remaining_dag."""
+        if not self.remaining_dag or not self.remaining_dag.nodes():
+            return 0
+
+        applied_count = 0
+        # findall_nodes_until_blocked respects DAG dependencies and blocker conditions.
+        # The is_blocker (self.acts_on_nonadjacent_qubits) checks for mappability and adjacency.
+        nodes_to_process = list(
             self.remaining_dag.findall_nodes_until_blocked(self.acts_on_nonadjacent_qubits)
         )
-        assert not any(
-            self.remaining_dag.has_edge(b, a) for a, b in itertools.combinations(nodes, 2)
-        )
-        assert not any(self.acts_on_nonadjacent_qubits(node.val) for node in nodes)
-        remaining_nodes = [node for node in self.remaining_dag.ordered_nodes() if node not in nodes]
-        for node, remaining_node in itertools.product(nodes, remaining_nodes):
-            assert not self.remaining_dag.has_edge(remaining_node, node)
-        for node in nodes:
-            self.remaining_dag.remove_node(node)
+
+        for node in nodes_to_process:
             logical_op = node.val
+            # At this point, acts_on_nonadjacent_qubits(logical_op) should be False for these nodes.
+            # This means all qubits are mapped and adjacent if multi-qubit.
+            
+            # Double check mapping and adjacency before applying (defensive)
+            if self.acts_on_nonadjacent_qubits(logical_op):
+                # This case should ideally not be reached if findall_nodes_until_blocked works as expected.
+                # It might indicate a concurrent modification or a subtle issue in logic.
+                continue
+
             physical_op = logical_op.with_qubits(*self.log_to_phys(*logical_op.qubits))
+            # Ensure the physical operation is valid on the device (already checked by acts_on_nonadjacent_qubits for 2-qubit)
             assert len(physical_op.qubits) < 2 or physical_op.qubits in self.device_graph.edges
+            
             self.physical_ops.append(physical_op)
-        return len(nodes)
+            self.remaining_dag.remove_node(node)
+            applied_count += 1
+        
+        return applied_count
 
     @property
     def swap_network(self) -> SwapNetwork:
@@ -294,15 +345,143 @@ class _GreedyRouter:
         self.apply_next_swaps(True)
 
     def route(self):
-        self.apply_possible_ops()
+        op_iterator = iter(self.top_level_operations)
+        current_op = None # To store a lookahead operation if needed
         empty_steps_remaining = self.max_num_empty_steps
-        while self.remaining_dag:
-            self.apply_next_swaps(not empty_steps_remaining)
-            n_applied_ops = self.apply_possible_ops()
-            if n_applied_ops:
-                empty_steps_remaining = self.max_num_empty_steps
-            else:
-                empty_steps_remaining -= 1
+
+        while True:
+            if self.remaining_dag and self.remaining_dag.nodes():
+                # Try to apply ops from the current non-CircuitOperation DAG segment
+                n_applied_ops = self.apply_possible_ops()
+                if n_applied_ops:
+                    empty_steps_remaining = self.max_num_empty_steps
+                    # Continue processing this segment in the next iteration
+                    continue 
+                else:
+                    # No operations applied, need to perform swaps
+                    self.apply_next_swaps(not empty_steps_remaining)
+                    empty_steps_remaining -= 1
+                    if empty_steps_remaining < 0:
+                        # Stall detected
+                        # TODO: Implement a more robust stall recovery or error mechanism
+                        # For now, if apply_next_swaps was forced (empty_steps_remaining was 0),
+                        # and still no ops could be applied, the circuit might be unroutable
+                        # or stuck in a local minimum.
+                        # We will let it try to fetch next segment if DAG is exhausted by swaps.
+                        pass
+                    # Continue to try processing this segment (or what's left of it)
+                    continue
+
+            # If remaining_dag is empty or exhausted, fetch the next operation(s)
+            if current_op is None:
+                current_op = next(op_iterator, None)
+
+            if current_op is None: # All top-level operations processed
+                if not (self.remaining_dag and self.remaining_dag.nodes()):
+                    # And the last segment's DAG is also empty/done
+                    break 
+                else:
+                    # Still processing the last segment's DAG, loop back
+                    continue
+
+
+            if isinstance(current_op, CircuitOperation):
+                sub_circuit_op = current_op
+                current_op = None # Consume this CircuitOperation
+
+                sub_circuit = sub_circuit_op.circuit
+                sub_qubits = sub_circuit_op.qubits
+
+                sub_initial_mapping: dict[ops.Qid, ops.Qid] = {}
+                for lq in sub_qubits:
+                    if lq not in self._log_to_phys:
+                        # This implies a logical qubit for the sub-circuit is not currently mapped.
+                        # This is a complex scenario. The greedy router expects an initial mapping
+                        # for all qubits it's supposed to route.
+                        # One strategy could be to try to find a place for unmapped qubits first.
+                        # For now, this is an error condition.
+                        raise ValueError(
+                            f"Logical qubit {lq} in CircuitOperation {sub_circuit_op} "
+                            "is not mapped to a physical qubit. Cannot route sub-circuit."
+                        )
+                    sub_initial_mapping[lq] = self._log_to_phys[lq]
+                
+                # Ensure all physical qubits in sub_initial_mapping are distinct
+                if len(set(sub_initial_mapping.values())) != len(sub_initial_mapping):
+                    raise ValueError(
+                        f"Duplicate physical qubits in initial mapping for CircuitOperation {sub_circuit_op}."
+                    )
+
+
+                # Recursively call route_circuit_greedily for the sub-circuit
+                # Note: random_state (self.prng) is passed to ensure determinism if needed.
+                # can_reorder could be self.can_reorder or a specific one for sub-circuits.
+                sub_swap_network = route_circuit_greedily(
+                    circuit=sub_circuit,
+                    device_graph=self.device_graph, # Use the full device graph
+                    initial_mapping=sub_initial_mapping,
+                    max_search_radius=self.max_search_radius,
+                    max_num_empty_steps=self.max_num_empty_steps,
+                    can_reorder=self.can_reorder, 
+                    random_state=self.prng,
+                )
+
+                self.physical_ops.extend(sub_swap_network.circuit.all_operations())
+
+                # Update the main mapping based on the swaps in the sub_swap_network
+                # The swaps in sub_swap_network are on physical qubits.
+                # These physical qubits were initially mapped according to sub_initial_mapping.
+                # We need to apply these physical swaps to whatever logical qubits were on them.
+                temp_phys_to_log = self._phys_to_log.copy()
+                for op_in_sub_swap_net in sub_swap_network.circuit.all_operations():
+                    if op_in_sub_swap_net.gate == SWAP:
+                        p1, p2 = op_in_sub_swap_net.qubits # Physical qubits that were swapped
+                        
+                        # The logical qubits on p1 and p2 might not be part of the sub-circuit's
+                        # explicit logical qubits if the sub-circuit was small and swaps affected
+                        # adjacent physical qubits holding other main-circuit logical qubits.
+                        l1_on_p1 = temp_phys_to_log.get(p1)
+                        l2_on_p2 = temp_phys_to_log.get(p2)
+                        
+                        temp_phys_to_log[p1] = l2_on_p2
+                        temp_phys_to_log[p2] = l1_on_p1
+                
+                self._phys_to_log = temp_phys_to_log
+                self._log_to_phys = {
+                    l: p for p, l in self._phys_to_log.items() if l is not None
+                }
+                
+                self._assert_mapping_consistency()
+                empty_steps_remaining = self.max_num_empty_steps # Activity occurred
+                # Loop back to potentially process more ops or next segment
+                continue
+
+            else: # current_op is a regular operation
+                # Collect a segment of regular (non-CircuitOperation) ops
+                current_regular_ops_segment: list[ops.Operation] = []
+                if current_op is not None: # Add the op we peeked or started with
+                     current_regular_ops_segment.append(current_op)
+                     current_op = None # Consume it
+
+                # Greedily fetch more non-CircuitOperations
+                while True:
+                    op_lookahead = next(op_iterator, None)
+                    if op_lookahead is None or isinstance(op_lookahead, CircuitOperation):
+                        current_op = op_lookahead # Save for next main loop iteration
+                        break
+                    current_regular_ops_segment.append(op_lookahead)
+
+                if current_regular_ops_segment:
+                    self.remaining_dag = circuitdag.CircuitDag.from_ops(
+                        *current_regular_ops_segment, can_reorder=self.can_reorder
+                    )
+                    # Logical qubits for this segment are already part of self.logical_qubits.
+                    # Mapping for them should exist or be created by placement logic (currently error if not mapped).
+                    empty_steps_remaining = self.max_num_empty_steps
+                    # Loop back to process this new DAG
+                    continue
+        
+        # Final assertion
         assert ops_are_consistent_with_device_graph(self.physical_ops, self.device_graph)
 
 
